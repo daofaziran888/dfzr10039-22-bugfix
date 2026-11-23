@@ -6,7 +6,7 @@ from app.services.crawl_site import CrawlSiteService
 from app.services.proxy_pool import ProxyPoolService
 from app.services.anti_block import AntiBlockService
 from app.services.crawl_job import CrawlJobService
-from app.services.url_dedup import UrlDedupService
+from app.services.url_dedup import UrlDedupService, UrlDedupClaimService
 from app.services.content_extract import ContentExtractService
 from app.services.field_clean import FieldCleanService
 from app.services.batch_store import BatchStoreService
@@ -31,6 +31,7 @@ SERVICES: dict[str, BaseModuleService] = {
     "anti_block": AntiBlockService(),
     "crawl_job": CrawlJobService(),
     "url_dedup": UrlDedupService(),
+    "url_dedup_claim": UrlDedupClaimService(),
     "content_extract": ContentExtractService(),
     "field_clean": FieldCleanService(),
     "batch_store": BatchStoreService(),

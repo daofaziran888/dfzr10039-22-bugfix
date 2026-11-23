@@ -14,15 +14,17 @@ from __future__ import annotations
 
 import random
 import re
+import threading
 from datetime import datetime, timezone
 from typing import Any
 
 from app.models import (
     AntiBlockStrategy, AntiType, ArchiveFormat, ArchivePolicy, CleanedContent,
     CleanRule, CostRecord, CrawlJobSpec, CrawlLimitRule, DeliveryFormat,
-    DeliveryTask, DiffRecord, ExtractRule, IncrCursor, ParseLogEntry,
-    ProxyNode, QualitySample, RawExtractedContent, SampleMethod,
-    SchedulePlan, SiteConfig, SiteType, StorageBatch, UrlFingerprint,
+    DeliveryTask, DedupClaim, DedupOutcome, DiffRecord, ExtractRule,
+    IncrCursor, ParseLogEntry, ProxyNode, QualitySample, RawExtractedContent,
+    SampleMethod, SchedulePlan, SiteConfig, SiteType, StorageBatch,
+    UrlFingerprint,
 )
 from app.store import store
 
@@ -209,27 +211,469 @@ def _cast_type(value: str, target: str) -> Any:
 # 流水线 2: crawl_job → url_dedup → parse_log
 # ---------------------------------------------------------------------------
 
-def run_dedup_flow(job: CrawlJobSpec) -> tuple[list[UrlFingerprint], list[UrlFingerprint]]:
-    """对采集作业的入口 URL 执行去重，返回新增和重复列表。"""
-    existing: dict[str, UrlFingerprint] = {}
+# 指纹台账和认领回执都要在同一个临界区里读写：并发提交等价地址时，
+# “查到没有指纹”和“登记指纹/认领”之间不能被另一个请求插入。
+_DEDUP_LOCK = threading.RLock()
+CLAIM_MODULE = "url_dedup_claim"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _window_tag(window: str) -> str:
+    tag = re.sub(r"[^0-9A-Za-z]+", "", str(window))
+    return tag[:24] or "now"
+
+
+def _default_window() -> str:
+    """未显式给窗口时按小时分桶；显式窗口才是调度真正登记的值。"""
+    return datetime.now(timezone.utc).strftime("%Y%m%d%H")
+
+
+def _fingerprint_lookup() -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """按哈希和规范 URL 双向索引台账，兼容早期没有写规范 URL 的历史指纹。"""
+    by_hash: dict[str, dict[str, Any]] = {}
+    by_canonical: dict[str, dict[str, Any]] = {}
     for row in store.rows("url_dedup"):
         fp = UrlFingerprint.from_seed_row(row)
-        existing[fp.hash_value] = fp
+        if fp.hash_value:
+            by_hash.setdefault(fp.hash_value, row)
+        canonical = fp.canonical_url or UrlFingerprint.normalize(fp.source_url)
+        if canonical:
+            by_canonical.setdefault(canonical, row)
+    return by_hash, by_canonical
 
-    new_fps: list[UrlFingerprint] = []
-    dup_fps: list[UrlFingerprint] = []
 
-    for url in job.entry_urls:
-        fp = UrlFingerprint.compute(url)
-        if fp.hash_value in existing:
-            existing[fp.hash_value].duplicate_count += 1
-            dup_fps.append(existing[fp.hash_value])
-        else:
-            existing[fp.hash_value] = fp
-            new_fps.append(fp)
-            _persist_fingerprint(fp)
+def _fingerprint_payload(fp: UrlFingerprint) -> dict[str, Any]:
+    return {
+        "指纹编号": fp.fingerprint_id,
+        "源URL": fp.source_url,
+        "规范URL": fp.canonical_url or UrlFingerprint.normalize(fp.source_url),
+        "指纹算法": fp.algorithm,
+        "指纹哈希": fp.hash_value,
+        "发现渠道": fp.discovery_channel,
+        "首次发现": fp.first_seen,
+        "重复次数": fp.duplicate_count,
+        "去重状态": fp.status,
+        "最近认领窗口": fp.window,
+        "实际采集入口": fp.claimed_url,
+        "回执编号": fp.receipt_id,
+        "最近确认": _now_iso(),
+        "重复来源": "",
+    }
 
-    return new_fps, dup_fps
+
+def _apply_fingerprint_row(row: dict[str, Any], fp: UrlFingerprint) -> None:
+    """把指纹对象的确认结果写回台账行；首次发现等历史信息只在缺失时补。"""
+    payload = _fingerprint_payload(fp)
+    if not str(row.get("首次发现") or "").strip():
+        row["首次发现"] = payload["首次发现"]
+    row["指纹编号"] = row.get("指纹编号") or payload["指纹编号"]
+    row["源URL"] = row.get("源URL") or payload["源URL"]
+    row["规范URL"] = payload["规范URL"]
+    row["指纹算法"] = row.get("指纹算法") or payload["指纹算法"]
+    if not str(row.get("指纹哈希") or "").strip():
+        row["指纹哈希"] = payload["指纹哈希"]
+    row["发现渠道"] = row.get("发现渠道") or payload["发现渠道"]
+    row["重复次数"] = fp.duplicate_count
+    row["去重状态"] = fp.status
+    row["最近认领窗口"] = fp.window
+    row["实际采集入口"] = fp.claimed_url
+    row["回执编号"] = fp.receipt_id
+    row["最近确认"] = payload["最近确认"]
+    # 台账列表用 status 展示去重状态，两处必须同步，刷新后才一致。
+    row["status"] = fp.status
+
+
+def _persist_fingerprint(fp: UrlFingerprint) -> dict[str, Any]:
+    rows = store.rows("url_dedup")
+    row: dict[str, Any] = {
+        "id": max((int(row.get("id", 0)) for row in rows), default=0) + 1,
+        ** _fingerprint_payload(fp),
+        "status": fp.status,
+        "pending": False,
+        "abnormal": False,
+    }
+    rows.append(row)
+    return row
+
+
+def _own_receipt_key(hash_value: str, window: str, job_id: str, url: str):
+    return (hash_value, window, job_id, str(url).strip())
+
+
+def _claim_row_index() -> tuple[dict[tuple[str, str, str, str], dict[str, Any]],
+                                dict[tuple[str, str], dict[str, Any]]]:
+    """回执索引：own 用于同一作业重试幂等，qualification 用于窗口采集资格。
+
+    own 用原始提交入口精确匹配：只有“同作业 + 同原始地址”才算中断重试；
+    参数顺序不同但等价的地址属于新的重复发现，必须登记为重复入口。
+    """
+    own: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    qualified: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in store.rows(CLAIM_MODULE):
+        hash_value = str(row.get("指纹哈希", ""))
+        window = str(row.get("认领窗口", ""))
+        submitted = str(row.get("提交入口", "")).strip()
+        key = _own_receipt_key(
+            hash_value, window, str(row.get("作业编号", "")), submitted)
+        own.setdefault(key, row)
+        if str(row.get("去重状态", "")) in ("实际采集", "待执行", "已采集"):
+            qualified.setdefault((hash_value, window), row)
+    return own, qualified
+
+
+def _claim_from_row(row: dict[str, Any]) -> DedupClaim:
+    def _urls(key: str) -> list[str]:
+        raw = row.get(key, "")
+        if isinstance(raw, (list, tuple)):
+            return [str(item) for item in raw if str(item).strip()]
+        return [item.strip() for item in str(raw).split(",") if item.strip()]
+
+    return DedupClaim(
+        claim_id=str(row.get("回执编号", "")),
+        fingerprint_id=str(row.get("指纹编号", "")),
+        hash_value=str(row.get("指纹哈希", "")),
+        window=str(row.get("认领窗口", "")),
+        job_id=str(row.get("作业编号", "")),
+        site=str(row.get("目标站点", "")),
+        submitted_url=str(row.get("提交入口", "")),
+        executed_url=str(row.get("实际采集入口", "")),
+        duplicate_urls=_urls("重复入口"),
+        status=str(row.get("去重状态", "实际采集")),
+        first_seen=str(row.get("首次发现", "")),
+        confirmed_at=str(row.get("确认时间", "")),
+        duplicate_events=int(row.get("重复次数", 0) or 0),
+        linked_receipt_id=str(row.get("关联回执", "")),
+    )
+
+
+def _claim_row_payload(claim: DedupClaim) -> dict[str, Any]:
+    return {
+        "回执编号": claim.claim_id,
+        "指纹编号": claim.fingerprint_id,
+        "指纹哈希": claim.hash_value,
+        "认领窗口": claim.window,
+        "作业编号": claim.job_id,
+        "目标站点": claim.site,
+        "提交入口": claim.submitted_url,
+        "实际采集入口": claim.executed_url,
+        "重复入口": ",".join(claim.duplicate_urls),
+        "关联回执": claim.linked_receipt_id,
+        "首次发现": claim.first_seen,
+        "确认时间": claim.confirmed_at,
+        "去重状态": claim.status,
+        "重复次数": claim.duplicate_events,
+        "status": claim.status,
+        "pending": claim.status in ("实际采集", "待执行"),
+        "abnormal": False,
+    }
+
+
+def _persist_claim(claim: DedupClaim) -> dict[str, Any]:
+    rows = store.rows(CLAIM_MODULE)
+    row: dict[str, Any] = {
+        "id": max((int(row.get("id", 0)) for row in rows), default=0) + 1,
+        "执行时间": "",
+        **_claim_row_payload(claim),
+    }
+    rows.append(row)
+    return row
+
+
+def _sync_claim_row(row: dict[str, Any], claim: DedupClaim) -> None:
+    row.update(_claim_row_payload(claim))
+
+
+def _duplicate_source_key(job_id: str, url: str) -> str:
+    # 用规范 URL 做键：交换查询参数顺序的等价地址、作业中断后的重试都只计一次。
+    return f"{job_id}|{UrlFingerprint.normalize(url)}"
+
+
+def _mark_fingerprint_duplicate(row: dict[str, Any], fp: UrlFingerprint,
+                                job_id: str, url: str) -> bool:
+    """登记一次重复确认；同一作业同一原始入口只计一次，避免重复提交重复计数。"""
+    key = _duplicate_source_key(job_id, url)
+    sources = [item for item in str(row.get("重复来源", "")).split(",") if item]
+    if key in sources:
+        return False
+    sources.append(key)
+    row["重复来源"] = ",".join(sources)
+    fp.duplicate_count += 1
+    return True
+
+
+def run_dedup_flow(job: CrawlJobSpec) -> tuple[list[UrlFingerprint], list[UrlFingerprint]]:
+    """对采集作业的入口 URL 执行去重，返回新增和重复列表。
+
+    重复次数、首次发现等确认结果都会立即写回指纹台账；再次读取台账与本次
+    返回值一致。同一作业重复提交同一原始地址只计一次。
+    """
+    with _DEDUP_LOCK:
+        by_hash, by_canonical = _fingerprint_lookup()
+        new_fps: list[UrlFingerprint] = []
+        dup_fps: list[UrlFingerprint] = []
+
+        for url in job.entry_urls:
+            fp = UrlFingerprint.compute(url)
+            row = by_hash.get(fp.hash_value) or by_canonical.get(fp.canonical_url)
+
+            if row is None:
+                new_fps.append(fp)
+                row = _persist_fingerprint(fp)
+                by_hash[fp.hash_value] = row
+                by_canonical[fp.canonical_url] = row
+                continue
+
+            confirmed = UrlFingerprint.from_seed_row(row)
+            confirmed.canonical_url = confirmed.canonical_url or fp.canonical_url
+            confirmed.source_url = confirmed.source_url or fp.source_url
+            # 首次发现沿用台账里的历史值，只在缺失时补当前时间。
+            confirmed.first_seen = confirmed.first_seen or fp.first_seen
+            _mark_fingerprint_duplicate(row, confirmed, job.job_id, url)
+            _apply_fingerprint_row(row, confirmed)
+            by_hash[confirmed.hash_value or row.get("指纹哈希", "")] = row
+            by_canonical[confirmed.canonical_url] = row
+            dup_fps.append(confirmed)
+
+        return new_fps, dup_fps
+
+
+def load_fingerprint_receipt(url_or_hash: str) -> dict[str, Any] | None:
+    """从持久化台账读取指纹回执；调度和作业认领都必须走这里，不能只看内存结果。"""
+    by_hash, by_canonical = _fingerprint_lookup()
+    row = by_hash.get(url_or_hash)
+    if row is None:
+        normalized = UrlFingerprint.normalize(url_or_hash)
+        row = by_canonical.get(normalized)
+    if row is None:
+        return None
+    fp = UrlFingerprint.from_seed_row(row)
+    return {
+        "fingerprint": fp,
+        "repeated": fp.duplicate_count,
+        "first_seen": fp.first_seen,
+        "window": fp.window,
+        "claimed_url": fp.claimed_url,
+        "receipt_id": fp.receipt_id,
+        "status": fp.status,
+        "canonical_url": fp.canonical_url,
+    }
+
+
+def fingerprint_receipt(url_or_hash: str) -> dict[str, Any] | None:
+    """load_fingerprint_receipt 的别名，便于按业务叫法取回执。"""
+    return load_fingerprint_receipt(url_or_hash)
+
+
+def register_fingerprint(source_url: str, algorithm: str = "sha256",
+                         fingerprint_id: str = "", first_seen: str | None = None,
+                         discovery_channel: str | None = None,
+                         status: str | None = None) -> dict[str, Any]:
+    """登记一条去重指纹：规范URL、哈希、首次发现一次算好，台账与回执同源。
+
+    同一等价地址已存在时返回既有台账行（补齐缺失字段），不产生重复指纹。
+    """
+    with _DEDUP_LOCK:
+        fp = UrlFingerprint.compute(source_url, algorithm)
+        by_hash, by_canonical = _fingerprint_lookup()
+        existing = by_hash.get(fp.hash_value) or by_canonical.get(fp.canonical_url)
+        if existing is not None:
+            row = UrlFingerprint.from_seed_row(existing)
+            row.canonical_url = row.canonical_url or fp.canonical_url
+            row.first_seen = row.first_seen or fp.first_seen
+            _apply_fingerprint_row(existing, row)
+            return existing
+        fp.fingerprint_id = fingerprint_id or fp.fingerprint_id
+        fp.first_seen = first_seen or fp.first_seen
+        fp.discovery_channel = discovery_channel or fp.discovery_channel
+        fp.status = status or fp.status
+        return _persist_fingerprint(fp)
+
+
+def _claim_url_locked(job: CrawlJobSpec, url: str, window: str) -> DedupOutcome:
+    """在已持锁的临界区内完成一次“确认 + 认领”，并发下只有一份能实际采集。"""
+    submitted = UrlFingerprint.compute(url)
+    by_hash, by_canonical = _fingerprint_lookup()
+    fp_row = by_hash.get(submitted.hash_value) or by_canonical.get(submitted.canonical_url)
+    is_new = fp_row is None
+
+    if fp_row is None:
+        fp_row = _persist_fingerprint(submitted)
+        by_hash[submitted.hash_value] = fp_row
+        by_canonical[submitted.canonical_url] = fp_row
+        fp = submitted
+    else:
+        # 历史指纹可能没有规范URL/首次发现，这里按现有台账补全而不是覆盖。
+        fp = UrlFingerprint.from_seed_row(fp_row)
+        fp.canonical_url = fp.canonical_url or submitted.canonical_url
+        fp.first_seen = fp.first_seen or submitted.first_seen
+        fp.source_url = fp.source_url or submitted.source_url
+
+    own_index, qualification_index = _claim_row_index()
+    own_row = own_index.get(_own_receipt_key(fp.hash_value, window, job.job_id, url))
+    qualification_row = qualification_index.get((fp.hash_value, window))
+    receipt_id = f"CLM-{fp.hash_value[:12]}-{_window_tag(window)}"
+
+    if own_row is not None:
+        # 同一作业、同一原始入口、同一窗口：就是上一轮的中断重试。
+        # 已采集过的不再执行；已认领未执行的接着执行那一份。
+        claim = _claim_from_row(own_row)
+        resumable = claim.status in ("实际采集", "待执行")
+        _apply_fingerprint_row(fp_row, fp)
+        return DedupOutcome(
+            fingerprint=fp, claim=claim, is_new=False,
+            is_duplicate=not resumable, can_crawl=resumable,
+            submitted_urls=[url], duplicate_urls=list(claim.duplicate_urls),
+            window=window,
+            reason="恢复中断前的认领回执" if resumable else "上一轮已完成实际采集，重试幂等",
+        )
+
+    if fp.status == "永久排除":
+        claim = DedupClaim(
+            claim_id=receipt_id,
+            fingerprint_id=fp.fingerprint_id, hash_value=fp.hash_value,
+            window=window, job_id=job.job_id, site=job.site.domain,
+            submitted_url=url, executed_url="", status="永久排除",
+            first_seen=fp.first_seen, confirmed_at=_now_iso(),
+        )
+        _apply_fingerprint_row(fp_row, fp)
+        _persist_claim(claim)
+        return DedupOutcome(
+            fingerprint=fp, claim=claim, is_new=is_new, is_duplicate=True,
+            can_crawl=False, submitted_urls=[url], window=window,
+            reason="指纹已永久排除",
+        )
+
+    if qualification_row is not None:
+        # 资格已被其它作业或本窗口另一个等价地址拿走：只登记重复，不产生第二次采集。
+        owner = _claim_from_row(qualification_row)
+        claim = DedupClaim(
+            claim_id=f"{receipt_id}-{_window_tag(job.job_id)}",
+            fingerprint_id=fp.fingerprint_id, hash_value=fp.hash_value,
+            window=window, job_id=job.job_id, site=job.site.domain,
+            submitted_url=url, executed_url="",
+            status="窗口重复", first_seen=fp.first_seen, confirmed_at=_now_iso(),
+            linked_receipt_id=owner.claim_id,
+        )
+        changed = _mark_fingerprint_duplicate(fp_row, fp, job.job_id, url)
+        if url not in owner.duplicate_urls:
+            owner.duplicate_urls.append(url)
+        owner.duplicate_events = len(owner.duplicate_urls)
+        # 本作业没有领到采集资格：只登记自己这份重复的原始入口。
+        claim.duplicate_urls = [url]
+        claim.duplicate_events = owner.duplicate_events
+        _apply_fingerprint_row(fp_row, fp)
+        _sync_claim_row(qualification_row, owner)
+        _persist_claim(claim)
+        return DedupOutcome(
+            fingerprint=fp, claim=claim, is_new=False, is_duplicate=True,
+            can_crawl=False, submitted_urls=[url],
+            duplicate_urls=list(owner.duplicate_urls), window=window,
+            reason=(f"窗口 {window} 已由作业 {owner.job_id} 认领" if changed
+                    else f"窗口 {window} 的重复提交已登记"),
+        )
+
+    # 本窗口第一次认领：真正获得采集资格。
+    claim = DedupClaim(
+        claim_id=receipt_id,
+        fingerprint_id=fp.fingerprint_id, hash_value=fp.hash_value,
+        window=window, job_id=job.job_id, site=job.site.domain,
+        submitted_url=url, executed_url=url, status="实际采集",
+        first_seen=fp.first_seen, confirmed_at=_now_iso(),
+        duplicate_events=fp.duplicate_count,
+    )
+    fp.window = window
+    fp.claimed_url = url
+    fp.receipt_id = claim.claim_id
+    _apply_fingerprint_row(fp_row, fp)
+    _persist_claim(claim)
+    return DedupOutcome(
+        fingerprint=fp, claim=claim, is_new=is_new, is_duplicate=False,
+        can_crawl=True, submitted_urls=[url], window=window,
+        reason="获得本窗口采集资格",
+    )
+
+
+def claim_entry_url(job: CrawlJobSpec, url: str, window: str | None = None) -> DedupOutcome:
+    """为单个入口 URL 认领采集资格，返回含持久化指纹回执的结果。"""
+    return claim_dedup_window(job, window, urls=[url])[0]
+
+
+def claim_dedup_window(job: CrawlJobSpec, window: str | None = None,
+                       urls: list[str] | None = None) -> list[DedupOutcome]:
+    """对一个窗口内的作业入口批量认领；等价地址只保留第一次实际采集。"""
+    window = str(window or _default_window())
+    raw_targets = job.entry_urls if urls is None else urls
+    # 同一批里字面重复的原始入口只处理一次，否则第二次会被误判成“中断重试”。
+    targets = list(dict.fromkeys(url for url in raw_targets if str(url).strip()))
+    with _DEDUP_LOCK:
+        outcomes = [_claim_url_locked(job, url, window) for url in targets]
+    return outcomes
+
+
+def acquire_dedup_claims(job: CrawlJobSpec, window: str | None = None) -> list[DedupOutcome]:
+    """claim_dedup_window 的别名，供调度侧按“认领”语义调用。"""
+    return claim_dedup_window(job, window)
+
+
+def confirm_dedup_claim(job: CrawlJobSpec, window: str | None = None) -> list[DedupOutcome]:
+    """去重确认（含认领）的别名。"""
+    return claim_dedup_window(job, window)
+
+
+def mark_claim_executed(claim_or_id: DedupClaim | str, executed_url: str | None = None) -> DedupClaim | None:
+    """把认领回执标记为已实际采集；中断重试后再次调用是幂等的。"""
+    claim_id = claim_or_id if isinstance(claim_or_id, str) else claim_or_id.claim_id
+    with _DEDUP_LOCK:
+        for row in store.rows(CLAIM_MODULE):
+            if str(row.get("回执编号", "")) != claim_id:
+                continue
+            claim = _claim_from_row(row)
+            if claim.status in ("窗口重复", "永久排除"):
+                return claim
+            claim.status = "已采集"
+            claim.executed_url = executed_url or claim.executed_url or claim.submitted_url
+            row["去重状态"] = claim.status
+            row["实际采集入口"] = claim.executed_url
+            row["执行时间"] = _now_iso()
+            row["pending"] = False
+            row["status"] = claim.status
+            fingerprint_row = next(
+                (r for r in store.rows("url_dedup")
+                 if str(r.get("指纹哈希", "")) == claim.hash_value), None)
+            if fingerprint_row is not None:
+                fp = UrlFingerprint.from_seed_row(fingerprint_row)
+                fp.claimed_url = claim.executed_url
+                fp.window = claim.window
+                fp.receipt_id = claim.claim_id
+                _apply_fingerprint_row(fingerprint_row, fp)
+            return claim
+    return None
+
+
+def execute_claimed_urls(job: CrawlJobSpec, window: str | None = None) -> list[str]:
+    """认领后执行真实采集；只返回真正拿到资格并已登记的入口地址。"""
+    window = str(window or _default_window())
+    executed: list[str] = []
+    for outcome in claim_dedup_window(job, window):
+        if not outcome.can_crawl:
+            continue
+        mark_claim_executed(outcome.claim, outcome.claim.executed_url or outcome.claim.submitted_url)
+        executed.append(outcome.claim.executed_url)
+    return executed
+
+
+def claim_receipts(window: str | None = None) -> list[DedupClaim]:
+    """读取已持久化的认领回执列表，可按窗口过滤。"""
+    claims: list[DedupClaim] = []
+    for row in store.rows(CLAIM_MODULE):
+        claim = _claim_from_row(row)
+        if window is None or claim.window == window:
+            claims.append(claim)
+    return claims
+
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +931,180 @@ def schedule_job(job: CrawlJobSpec) -> SchedulePlan | None:
     return plan
 
 
+def _find_schedule_row(plan_id: str) -> dict[str, Any] | None:
+    for row in store.rows("scheduler"):
+        if str(row.get("计划编号", "")) == plan_id:
+            return row
+    return None
+
+
+def _find_job_row(job_id: str) -> dict[str, Any] | None:
+    for row in store.rows("crawl_job"):
+        if str(row.get("作业编号", "")) == job_id:
+            return row
+    return None
+
+
+def _claim_snapshot(outcome: DedupOutcome) -> dict[str, Any]:
+    """调度登记用的一份完整确认结果：窗口、领到的地址、执行和重复的原始入口。
+
+    重复次数取的是持久化台账的最新值，而不是某个局部对象，调度与页面看到的一致。
+    """
+    receipt = load_fingerprint_receipt(outcome.fingerprint.hash_value) or {}
+    executed = outcome.claim.executed_url or str(receipt.get("claimed_url") or "")
+    duplicate_urls = list(outcome.claim.duplicate_urls)
+    # 窗口重复的回执只是登记，实际采集属于领到资格的那份回执，不能算到本作业头上。
+    attributed_executed = executed if outcome.can_crawl or outcome.claim.status == "已采集" else ""
+    if outcome.can_crawl and outcome.claim.submitted_url != attributed_executed:
+        # 去重命中的原始入口仍然保留，便于核对“作业实际采集的入口网址”。
+        duplicate_urls.append(outcome.claim.submitted_url)
+    return {
+        "指纹编号": outcome.fingerprint.fingerprint_id,
+        "指纹哈希": outcome.fingerprint.hash_value,
+        "回执编号": outcome.claim.claim_id or str(receipt.get("receipt_id") or ""),
+        "认领窗口": outcome.window or str(receipt.get("window") or ""),
+        "实际采集入口": attributed_executed,
+        "重复入口": ",".join(dict.fromkeys(duplicate_urls)),
+        "重复次数": int(receipt.get("repeated", outcome.fingerprint.duplicate_count) or 0),
+        "首次发现": str(receipt.get("first_seen") or outcome.fingerprint.first_seen),
+        "作业编号": outcome.claim.job_id,
+        "目标站点": outcome.claim.site,
+    }
+
+
+def sync_claims_to_jobs(outcomes: list[DedupOutcome]) -> list[dict[str, Any]]:
+    """把去重确认结果同步到采集作业认领列表（crawl_job 行上的认领字段）。"""
+    by_job: dict[str, dict[str, Any]] = {}
+    for outcome in outcomes:
+        snapshot = _claim_snapshot(outcome)
+        job_id = snapshot["作业编号"]
+        aggregate = by_job.setdefault(job_id, {
+            "认领窗口": snapshot["认领窗口"],
+            "实际采集入口": [],
+            "重复入口": [],
+            "去重回执": [],
+            "去重状态": "已认领",
+        })
+        aggregate["认领窗口"] = aggregate["认领窗口"] or snapshot["认领窗口"]
+        if snapshot["实际采集入口"]:
+            aggregate["实际采集入口"].append(snapshot["实际采集入口"])
+        if snapshot["重复入口"]:
+            aggregate["重复入口"].append(snapshot["重复入口"])
+        if snapshot["回执编号"]:
+            aggregate["去重回执"].append(snapshot["回执编号"])
+
+    synced: list[dict[str, Any]] = []
+    for job_id, aggregate in by_job.items():
+        row = _find_job_row(job_id)
+        if row is None:
+            # 作业尚在内存规格里（未登记到台账）时也能从回执表取到认领列表。
+            synced.append({"作业编号": job_id, **{
+                "认领窗口": aggregate["认领窗口"],
+                "实际采集入口": list(dict.fromkeys(aggregate["实际采集入口"])),
+                "重复入口": list(dict.fromkeys(aggregate["重复入口"])),
+                "去重回执": list(dict.fromkeys(aggregate["去重回执"])),
+                "去重状态": aggregate["去重状态"],
+            }})
+            continue
+        executed = list(dict.fromkeys(aggregate["实际采集入口"]))
+        duplicates = [url for url in dict.fromkeys(aggregate["重复入口"])
+                      if url not in executed]
+        row["认领窗口"] = row.get("认领窗口") or aggregate["认领窗口"]
+        row["实际采集入口"] = ",".join(executed)
+        row["重复入口"] = ",".join(duplicates)
+        row["去重回执"] = ",".join(dict.fromkeys(aggregate["去重回执"]))
+        row["去重状态"] = "已去重" if duplicates else aggregate["去重状态"]
+        synced.append({
+            "作业编号": job_id,
+            "认领窗口": row["认领窗口"],
+            "实际采集入口": executed,
+            "重复入口": duplicates,
+            "去重回执": row["去重回执"],
+            "去重状态": row["去重状态"],
+        })
+    return synced
+
+
+def job_claim_list(job_id: str | None = None) -> list[dict[str, Any]]:
+    """采集作业认领列表：来自持久化回执表，页面刷新后与写入时一致。"""
+    rows: list[dict[str, Any]] = []
+    for claim in claim_receipts():
+        if job_id is not None and claim.job_id != job_id:
+            continue
+        receipt = load_fingerprint_receipt(claim.hash_value) or {}
+        rows.append({
+            "作业编号": claim.job_id,
+            "目标站点": claim.site,
+            "回执编号": claim.claim_id,
+            "指纹编号": claim.fingerprint_id,
+            "指纹哈希": claim.hash_value,
+            "认领窗口": claim.window,
+            "提交入口": claim.submitted_url,
+            "实际采集入口": claim.executed_url,
+            "重复入口": ",".join(claim.duplicate_urls),
+            "重复次数": int(receipt.get("repeated", claim.duplicate_events) or 0),
+            "首次发现": claim.first_seen or str(receipt.get("first_seen") or ""),
+            "去重状态": claim.status,
+            "可实际采集": claim.can_crawl,
+        })
+    return rows
+
+
+def dispatch_with_dedup(job: CrawlJobSpec,
+                        window: str | None = None) -> tuple[SchedulePlan | None, list[DedupOutcome]]:
+    """调度执行入口：先认领，再按同一份持久化回执登记窗口和地址，最后执行。
+
+    - 认领与指纹确认共用一把锁和一份台账，同一窗口并发提交只产生一次实际采集；
+    - 回执里的窗口和地址在调度计划上登记，便于下一次独立窗口继续处理；
+    - 真实执行的入口和窗口内重复的原始入口都写进调度回执。
+    """
+    window = str(window or _default_window())
+    outcomes = claim_dedup_window(job, window)
+
+    # 先按认领回执登记窗口和地址（此时还没执行）。
+    plan = schedule_job(job)
+    schedule_row = _find_schedule_row(plan.plan_id) if plan is not None else None
+    snapshots = [_claim_snapshot(outcome) for outcome in outcomes]
+    if schedule_row is not None:
+        schedule_row["认领窗口"] = window
+        schedule_row["认领地址"] = ",".join(
+            dict.fromkeys(s["实际采集入口"] for s in snapshots if s["实际采集入口"]))
+        schedule_row["去重回执"] = ",".join(
+            dict.fromkeys(s["回执编号"] for s in snapshots if s["回执编号"]))
+        schedule_row["指纹台账"] = ",".join(
+            dict.fromkeys(s["指纹哈希"] for s in snapshots if s["指纹哈希"]))
+
+    # 只有领到资格的回执才真实执行；窗口内重复的原始入口只登记不执行。
+    executed_urls: list[str] = []
+    duplicate_urls: list[str] = []
+    for outcome in outcomes:
+        snapshot = _claim_snapshot(outcome)
+        if snapshot["重复入口"]:
+            duplicate_urls.extend(snapshot["重复入口"].split(","))
+        if outcome.can_crawl:
+            mark_claim_executed(outcome.claim, outcome.claim.executed_url or outcome.claim.submitted_url)
+            executed_urls.append(outcome.claim.executed_url or outcome.claim.submitted_url)
+
+    if schedule_row is not None:
+        schedule_row["实际执行入口"] = ",".join(dict.fromkeys(executed_urls))
+        schedule_row["重复原始入口"] = ",".join(dict.fromkeys(duplicate_urls))
+        schedule_row["实际采集数"] = len(dict.fromkeys(executed_urls))
+        schedule_row["重复提交数"] = len(dict.fromkeys(duplicate_urls))
+        schedule_row["最近执行"] = _now_iso()
+        # 执行后再从同一份持久化回执取一次数，确认登记值与台账一致。
+        # 同一指纹在一批入口里只算一次，避免等价地址被重复累加。
+        unique_hashes = dict.fromkeys(s["指纹哈希"] for s in snapshots if s["指纹哈希"])
+        schedule_row["去重确认次数"] = sum(
+            int(receipt["repeated"]) for receipt in
+            (load_fingerprint_receipt(h) for h in unique_hashes) if receipt)
+        schedule_row["实际执行入口"] = ",".join(dict.fromkeys(executed_urls))
+        schedule_row["认领地址"] = schedule_row["实际执行入口"] or schedule_row["认领地址"]
+
+    sync_claims_to_jobs(outcomes)
+    return plan, outcomes
+
+
+
 # ---------------------------------------------------------------------------
 # 跨模块失败处理和恢复逻辑
 # ---------------------------------------------------------------------------
@@ -565,24 +1183,6 @@ def _persist_batch(batch: StorageBatch) -> None:
         "status": batch.status,
         "pending": False,
         "abnormal": batch.status == "校验失败",
-    })
-
-
-def _persist_fingerprint(fp: UrlFingerprint) -> None:
-    rows = store.rows("url_dedup")
-    rows.append({
-        "id": max((int(row.get("id", 0)) for row in rows), default=0) + 1,
-        "指纹编号": fp.fingerprint_id,
-        "源URL": fp.source_url,
-        "指纹算法": fp.algorithm,
-        "指纹哈希": fp.hash_value,
-        "发现渠道": fp.discovery_channel,
-        "首次发现": fp.first_seen,
-        "重复次数": fp.duplicate_count,
-        "去重状态": fp.status,
-        "status": fp.status,
-        "pending": False,
-        "abnormal": False,
     })
 
 
@@ -676,5 +1276,8 @@ def _persist_schedule(plan: SchedulePlan) -> None:
         "Cron表达式": plan.cron_expr, "时区设置": plan.timezone_setting,
         "依赖检查": plan.dependency_check, "失败通知": plan.failure_notify,
         "并发控制": plan.concurrency_control, "下次执行": plan.next_run,
+        "认领窗口": "", "认领地址": "", "去重回执": "", "指纹台账": "",
+        "实际执行入口": "", "重复原始入口": "", "实际采集数": 0,
+        "重复提交数": 0, "去重确认次数": 0, "最近执行": "",
         "status": plan.status, "pending": False, "abnormal": False,
     })

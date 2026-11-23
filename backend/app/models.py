@@ -168,7 +168,11 @@ class CrawlJobSpec:
 
 @dataclass
 class UrlFingerprint:
-    """URL 去重指纹：由 url_dedup 生成，crawl_job 在调度前检查。"""
+    """URL 去重指纹：由 url_dedup 生成，crawl_job 在调度前检查。
+
+    duplicate_count、window、claimed_url、receipt_id 是“指纹回执”的持久化字段：
+    每次确认都要写回台账，调度只能从这份回执取数，不能只用本次调用里的对象。
+    """
     fingerprint_id: str
     source_url: str
     algorithm: str
@@ -177,14 +181,24 @@ class UrlFingerprint:
     first_seen: str
     duplicate_count: int = 0
     status: str = "已记录"
+    canonical_url: str = ""
+    window: str = ""
+    claimed_url: str = ""
+    receipt_id: str = ""
 
-    @classmethod
-    def compute(cls, url: str, algorithm: str = "sha256") -> UrlFingerprint:
-        parsed = urlparse(url)
+    @staticmethod
+    def normalize(url: str) -> str:
+        """规范化 URL：忽略 fragment，查询参数按名排序，使等价地址得到同一指纹。"""
+        parsed = urlparse(str(url).strip())
         normalized = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
         params = "&".join(sorted(parsed.query.split("&"))) if parsed.query else ""
         if params:
             normalized += f"?{params}"
+        return normalized
+
+    @classmethod
+    def compute(cls, url: str, algorithm: str = "sha256") -> UrlFingerprint:
+        normalized = cls.normalize(url)
         h = hashlib.new(algorithm, normalized.encode()).hexdigest()
         return cls(
             fingerprint_id=f"FP-{h[:12]}",
@@ -193,24 +207,82 @@ class UrlFingerprint:
             hash_value=h,
             discovery_channel="crawl_job",
             first_seen=datetime.now(timezone.utc).isoformat(),
+            canonical_url=normalized,
         )
+
+    @staticmethod
+    def _text(value: Any) -> str:
+        return "" if value is None else str(value)
 
     @classmethod
     def from_seed_row(cls, row: dict[str, Any]) -> UrlFingerprint:
         try:
-            dup = int(row.get("重复次数", 0))
+            dup = int(row.get("重复次数") or 0)
         except (ValueError, TypeError):
             dup = 0
+        source_url = cls._text(row.get("源URL"))
+        canonical = cls._text(row.get("规范URL"))
+        if not canonical and source_url:
+            canonical = cls.normalize(source_url)
+        algorithm = cls._text(row.get("指纹算法")) or "sha256"
+        hash_value = cls._text(row.get("指纹哈希"))
+        if not hash_value and canonical:
+            # 历史指纹只登记了源URL：按规范URL补算哈希，保证还能被认领命中。
+            hash_value = hashlib.new(algorithm, canonical.encode()).hexdigest()
+        fingerprint_id = cls._text(row.get("指纹编号"))
+        if not fingerprint_id and hash_value:
+            fingerprint_id = f"FP-{hash_value[:12]}"
         return cls(
-            fingerprint_id=str(row.get("指纹编号", "")),
-            source_url=str(row.get("源URL", "")),
-            algorithm=str(row.get("指纹算法", "sha256")),
-            hash_value=str(row.get("指纹哈希", "")),
-            discovery_channel=str(row.get("发现渠道", "")),
-            first_seen=str(row.get("首次发现", "")),
+            fingerprint_id=fingerprint_id,
+            source_url=source_url,
+            algorithm=algorithm,
+            hash_value=hash_value,
+            discovery_channel=cls._text(row.get("发现渠道")),
+            first_seen=cls._text(row.get("首次发现")),
             duplicate_count=dup,
-            status=str(row.get("status", "已记录")),
+            status=cls._text(row.get("status")) or cls._text(row.get("去重状态")) or "已记录",
+            canonical_url=canonical,
+            window=cls._text(row.get("最近认领窗口")),
+            claimed_url=cls._text(row.get("实际采集入口")),
+            receipt_id=cls._text(row.get("回执编号")),
         )
+
+
+@dataclass
+class DedupClaim:
+    """去重认领回执：一个窗口内同一指纹只允许产生一次实际采集。"""
+    claim_id: str
+    fingerprint_id: str
+    hash_value: str
+    window: str
+    job_id: str
+    site: str
+    submitted_url: str
+    executed_url: str
+    duplicate_urls: list[str] = field(default_factory=list)
+    status: str = "实际采集"
+    first_seen: str = ""
+    confirmed_at: str = ""
+    duplicate_events: int = 0
+    linked_receipt_id: str = ""
+
+    @property
+    def can_crawl(self) -> bool:
+        return self.status == "实际采集"
+
+
+@dataclass
+class DedupOutcome:
+    """一次入口 URL 去重认领的完整结果，供采集作业和调度共同消费。"""
+    fingerprint: UrlFingerprint
+    claim: DedupClaim
+    is_new: bool
+    is_duplicate: bool
+    can_crawl: bool
+    submitted_urls: list[str] = field(default_factory=list)
+    duplicate_urls: list[str] = field(default_factory=list)
+    window: str = ""
+    reason: str = ""
 
 
 @dataclass
